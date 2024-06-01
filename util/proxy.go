@@ -14,9 +14,14 @@
 package util
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
+)
+
+var (
+	ErrTimeoutNotFound = fmt.Errorf("not defined")
 )
 
 func GetScrapeTimeout(maxScrapeTimeout, defaultScrapeTimeout *time.Duration, h http.Header) time.Duration {
@@ -28,14 +33,21 @@ func GetScrapeTimeout(maxScrapeTimeout, defaultScrapeTimeout *time.Duration, h h
 	if timeout > *maxScrapeTimeout {
 		timeout = *maxScrapeTimeout
 	}
+	if err == ErrTimeoutNotFound {
+		h.Set("X-Prometheus-Scrape-Timeout-Seconds", strconv.FormatUint(uint64(timeout/time.Second), 10))
+	}
 	return timeout
 }
 
 func GetHeaderTimeout(h http.Header) (time.Duration, error) {
-	timeoutSeconds, err := strconv.ParseFloat(h.Get("X-Prometheus-Scrape-Timeout-Seconds"), 64)
-	if err != nil {
-		return time.Duration(0 * time.Second), err
+	timeout := h.Get("X-Prometheus-Scrape-Timeout-Seconds")
+	if timeout != "" {
+		timeoutSeconds, err := strconv.ParseFloat(timeout, 64)
+		if err != nil {
+			return time.Duration(0 * time.Second), err
+		}
+		return time.Duration(timeoutSeconds * 1e9), nil
+	} else {
+		return time.Duration(0 * time.Second), ErrTimeoutNotFound
 	}
-
-	return time.Duration(timeoutSeconds * 1e9), nil
 }
