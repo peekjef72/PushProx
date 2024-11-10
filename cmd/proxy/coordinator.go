@@ -16,9 +16,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
-	"time"
+	"syscall"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
@@ -53,7 +54,9 @@ type Coordinator struct {
 	// Responses from clients.
 	responses map[string]chan *http.Response
 	// Clients we know about and when they last contacted us.
-	known map[string]time.Time
+	// known map[string]time.Time
+	// known map[string]*http.Request
+	known map[string]net.Conn
 
 	logger log.Logger
 }
@@ -63,11 +66,13 @@ func NewCoordinator(logger log.Logger) (*Coordinator, error) {
 	c := &Coordinator{
 		waiting:   map[string]chan *http.Request{},
 		responses: map[string]chan *http.Response{},
-		known:     map[string]time.Time{},
-		logger:    logger,
+		// known:     map[string]time.Time{},
+		// known:  map[string]*http.Request{},
+		known:  map[string]net.Conn{},
+		logger: logger,
 	}
 
-	go c.gc()
+	// go c.gc()
 	return c, nil
 }
 
@@ -139,10 +144,10 @@ func (c *Coordinator) DoScrape(ctx context.Context, r *http.Request) (*http.Resp
 }
 
 // WaitForScrapeInstruction registers a client waiting for a scrape result
-func (c *Coordinator) WaitForScrapeInstruction(fqdn string) (*http.Request, error) {
+func (c *Coordinator) WaitForScrapeInstruction(conn net.Conn, fqdn string) (*http.Request, error) {
 	level.Info(c.logger).Log("msg", "WaitForScrapeInstruction", "fqdn", fqdn)
 
-	c.addKnownClient(fqdn)
+	c.addKnownClient(conn, fqdn)
 	// TODO: What if the client times out?
 	ch := c.getRequestChannel(fqdn)
 
@@ -187,11 +192,12 @@ func (c *Coordinator) ScrapeResult(r *http.Response) error {
 	}
 }
 
-func (c *Coordinator) addKnownClient(fqdn string) {
+func (c *Coordinator) addKnownClient(conn net.Conn, fqdn string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.known[fqdn] = time.Now()
+	// c.known[fqdn] = time.Now()
+	c.known[fqdn] = conn
 	knownClients.Set(float64(len(c.known)))
 }
 
@@ -201,16 +207,29 @@ func (c *Coordinator) KnownClients(client string) []string {
 	defer c.mu.Unlock()
 
 	var known []string
-	limit := time.Now().Add(-*registrationTimeout)
+	// limit := time.Now().Add(-*registrationTimeout)
+	// if client != "" {
+	// 	known = make([]string, 0, 1)
+	// 	if t, ok := c.known[client]; ok && limit.Before(t) {
+	// 		known = append(known, client)
+	// 	}
+	// } else {
+	// 	known = make([]string, 0, len(c.known))
+	// 	for k, t := range c.known {
+	// 		if limit.Before(t) {
+	// 			known = append(known, k)
+	// 		}
+	// 	}
+	// }
 	if client != "" {
 		known = make([]string, 0, 1)
-		if t, ok := c.known[client]; ok && limit.Before(t) {
+		if conn, ok := c.known[client]; ok && !isConnected(conn) {
 			known = append(known, client)
 		}
 	} else {
 		known = make([]string, 0, len(c.known))
-		for k, t := range c.known {
-			if limit.Before(t) {
+		for k, conn := range c.known {
+			if !isConnected(conn) {
 				known = append(known, k)
 			}
 		}
@@ -218,22 +237,34 @@ func (c *Coordinator) KnownClients(client string) []string {
 	return known
 }
 
-// Garbagee collect old clients.
-func (c *Coordinator) gc() {
-	for range time.Tick(1 * time.Minute) {
-		func() {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			limit := time.Now().Add(-*registrationTimeout)
-			deleted := 0
-			for k, ts := range c.known {
-				if ts.Before(limit) {
-					delete(c.known, k)
-					deleted++
-				}
-			}
-			level.Info(c.logger).Log("msg", "GC of clients completed", "deleted", deleted, "remaining", len(c.known))
-			knownClients.Set(float64(len(c.known)))
-		}()
+func isConnected(conn net.Conn) bool {
+	f, err := conn.(*net.TCPConn).File()
+	if err != nil {
+		return false
 	}
+
+	b := []byte{0}
+	_, _, err = syscall.Recvfrom(int(f.Fd()), b, syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
+	return err != nil
 }
+
+// Garbagee collect old clients.
+// func (c *Coordinator) gc() {
+// 	for range time.Tick(1 * time.Minute) {
+// 		func() {
+// 			c.mu.Lock()
+// 			defer c.mu.Unlock()
+// 			limit := time.Now().Add(-*registrationTimeout)
+// 			deleted := 0
+// 			for k, ts := range c.known {
+// 				if ts.Before(limit) {
+// 					// c.waiting[k]
+// 					delete(c.known, k)
+// 					deleted++
+// 				}
+// 			}
+// 			level.Info(c.logger).Log("msg", "GC of clients completed", "deleted", deleted, "remaining", len(c.known))
+// 			knownClients.Set(float64(len(c.known)))
+// 		}()
+// 	}
+// }

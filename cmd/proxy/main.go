@@ -197,14 +197,33 @@ func (h *httpHandler) handlePush(w http.ResponseWriter, r *http.Request) {
 // handlePoll handles clients registering and asking for scrapes.
 func (h *httpHandler) handlePoll(w http.ResponseWriter, r *http.Request) {
 	fqdn, _ := io.ReadAll(r.Body)
-	request, err := h.coordinator.WaitForScrapeInstruction(strings.TrimSpace(string(fqdn)))
+	var (
+		conn net.Conn
+		err  error
+	)
+	if hj, ok := w.(http.Hijacker); ok {
+		conn, _, err = hj.Hijack()
+		if err != nil {
+			level.Warn(h.logger).Log("msg", "Error WaitForScrapeInstruction:", "err", err)
+		}
+		defer func() {
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}()
+	}
+	request, err := h.coordinator.WaitForScrapeInstruction(conn, strings.TrimSpace(string(fqdn)))
 	if err != nil {
-		level.Info(h.logger).Log("msg", "Error WaitForScrapeInstruction:", "err", err)
+		level.Warn(h.logger).Log("msg", "Error WaitForScrapeInstruction:", "err", err)
 		http.Error(w, fmt.Sprintf("Error WaitForScrapeInstruction: %s", err.Error()), http.StatusRequestTimeout)
 		return
 	}
 	//nolint:errcheck // https://github.com/prometheus-community/PushProx/issues/111
-	request.WriteProxy(w) // Send full request as the body of the response.
+	wio := bufio.NewWriter(conn)
+	err = request.WriteProxy(wio) // Send full request as the body of the response.
+	if err != nil {
+		level.Warn(h.logger).Log("msg", "Can't send response to /poll", "err", err.Error())
+	}
 	level.Info(h.logger).Log("msg", "Responded to /poll", "url", request.URL.String(), "scrape_id", request.Header.Get("Id"))
 }
 
@@ -221,8 +240,15 @@ func (h *httpHandler) isPoller(r *http.Request) (bool, string) {
 	)
 
 	if len(h.pollersNet) > 0 {
-		if i := strings.Index(r.RemoteAddr, ":"); i != -1 {
+		// ipv4 with port has only one ":" symbol : e.g. 192.168.1.68:8080
+		// since ipv6 may have severals : []::FFFF:C0AB:1]:8080 [::1]:8080
+		// in anycase we want split the port part to only have ip part
+		if i := strings.LastIndex(r.RemoteAddr, ":"); i != -1 {
 			clientip = r.RemoteAddr[0:i]
+			// if ipv6 enclosed with '[' remove first and last char [ipv6]
+			if clientip[0] == '[' {
+				clientip = clientip[1 : len(clientip)-1]
+			}
 		}
 		for key := range h.pollersNet {
 			ip := net.ParseIP(clientip)
